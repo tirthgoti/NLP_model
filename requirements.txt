@@ -1,0 +1,8 @@
+streamlit
+transformers
+diffusers
+torch
+torchvision
+accelerate
+matplotlib
+networkx

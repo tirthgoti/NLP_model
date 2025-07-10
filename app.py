@@ -1,131 +1,95 @@
-import streamlit as st
+import gradio as gr
 from transformers import pipeline
 from diffusers import StableDiffusionPipeline
 import torch
-import networkx as nx
+from PIL import Image
 import matplotlib.pyplot as plt
+import networkx as nx
+from io import BytesIO
 
-# Set Streamlit config
-st.set_page_config(page_title="EcoNLP AI App", layout="centered")
-st.title("🌍 EcoNLP: Environmental AI Assistant")
+# Load Models
+classifier = pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
+ner = pipeline("ner", grouped_entities=True)
+fill_mask = pipeline("fill-mask", model="bert-base-uncased")
 
-# Create 4 tabs
-tab1, tab2, tab3, tab4 = st.tabs([
-    "🧠 Text Classifier",
-    "🎨 Text-to-Image",
-    "🗺️ NER + Graph",
-    "✍️ Text Infilling"
-])
+if torch.cuda.is_available():
+    image_pipe = StableDiffusionPipeline.from_pretrained(
+        "runwayml/stable-diffusion-v1-5",
+        torch_dtype=torch.float16,
+        revision="fp16",
+        use_auth_token=True  # OR use os.getenv("HF_TOKEN")
+    ).to("cuda")
+else:
+    image_pipe = StableDiffusionPipeline.from_pretrained(
+        "runwayml/stable-diffusion-v1-5"
+    ).to("cpu")
 
-# ---------------- TAB 1: Environmental Text Classifier ---------------- #
-with tab1:
-    st.header("🧠 Environmental Text Classifier")
-    classifier = pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
+# Functions
+def classify_text(text):
     labels = ["Forest", "Ocean", "Desert", "Urban", "Agriculture"]
-    user_input = st.text_area("✍️ Enter your sentence:", height=100)
+    result = classifier(text, candidate_labels=labels)
+    return f"Predicted Label: {result['labels'][0]} (Score: {result['scores'][0]:.2f})"
 
-    if st.button("Classify", key="classify"):
-        if not user_input.strip():
-            st.warning("Please enter a sentence.")
-        else:
-            result = classifier(user_input, candidate_labels=labels)
-            top_label = result['labels'][0]
-            st.success(f"**Predicted Category:** {top_label}")
-            st.subheader("🔎 Confidence Scores")
-            for label, score in zip(result['labels'], result['scores']):
-                st.write(f"**{label}:** {score:.3f}")
+def generate_image(prompt):
+    image = image_pipe(prompt).images[0]
+    return image
 
-# ---------------- TAB 2: Text-to-Image Generator ---------------- #
-with tab2:
-    st.header("🎨 Text-to-Image Generator")
-    prompt = st.text_input("📝 Describe a scene to generate:", placeholder="A misty forest with tall pine trees")
+def extract_ner_graph(text):
+    entities = ner(text)
+    G = nx.Graph()
 
-    if st.button("Generate Image", key="generate"):
+    for ent in entities:
+        G.add_node(ent['word'], label=ent['entity_group'])
 
-        if not prompt.strip():
-            st.warning("Please enter a prompt.")
-        else:
-            with st.spinner("Generating image..."):
+    for i in range(len(entities) - 1):
+        G.add_edge(entities[i]['word'], entities[i + 1]['word'])
 
-                @st.cache_resource
-                def load_image_model():
-                    return StableDiffusionPipeline.from_pretrained(
-                        "runwayml/stable-diffusion-v1-5",
-                        torch_dtype=torch.float16,
-                        revision="fp16",
-                        use_auth_token=True  # replace with your Hugging Face token if needed
-                    ).to("cuda" if torch.cuda.is_available() else "cpu")
+    fig, ax = plt.subplots()
+    pos = nx.spring_layout(G)
+    labels = nx.get_node_attributes(G, "label")
+    node_colors = ["skyblue" if labels[n] == "LOC" else "lightgreen" for n in G.nodes]
+    nx.draw(G, pos, with_labels=True, node_color=node_colors, edge_color='gray', node_size=2000, font_size=9, ax=ax)
+    nx.draw_networkx_labels(G, pos, labels={n: f"{n}\\n({labels[n]})" for n in labels})
+    
+    buf = BytesIO()
+    plt.savefig(buf, format="png")
+    plt.close(fig)
+    buf.seek(0)
+    return Image.open(buf)
 
-                pipe = load_image_model()
-                image = pipe(prompt).images[0]
-                st.image(image, caption="🖼️ Generated Image", use_column_width=True)
+def fill_text(text):
+    if "[MASK]" not in text.upper():
+        return ["Please include at least one [MASK] token."]
+    tokenized = text.replace("[mask]", "[MASK]").replace("[MASK]", fill_mask.tokenizer.mask_token)
+    results = fill_mask(tokenized)
+    return [r["sequence"] for r in results[:5]]
 
-# ---------------- TAB 3: Named Entity Recognition + Graph ---------------- #
-with tab3:
-    st.header("🗺️ Named Entity Recognition with Graph")
-    ner_input = st.text_area("🔍 Enter a sentence for entity detection:")
+# Gradio UI
+with gr.Blocks() as demo:
+    gr.Markdown("# 🌍 EcoNLP: Environmental AI Assistant")
 
-    if st.button("Extract Entities", key="ner"):
-        if not ner_input.strip():
-            st.warning("Please enter some text.")
-        else:
-            with st.spinner("Extracting entities..."):
-                ner_pipeline = pipeline("ner", model="dslim/bert-base-NER", aggregation_strategy="simple")
-                entities = ner_pipeline(ner_input)
+    with gr.Tab("🧠 Sentence Classification"):
+        txt_input = gr.Textbox(label="Enter environmental sentence")
+        txt_output = gr.Textbox(label="Classification Result")
+        btn = gr.Button("Classify")
+        btn.click(classify_text, txt_input, txt_output)
 
-                if entities:
-                    st.success("Entities detected:")
-                    for ent in entities:
-                        st.write(f"- **{ent['word']}** ({ent['entity_group']})")
+    with gr.Tab("🎨 Text-to-Image"):
+        img_input = gr.Textbox(label="Describe an image")
+        img_output = gr.Image(type="pil")
+        btn_img = gr.Button("Generate Image")
+        btn_img.click(generate_image, img_input, img_output)
 
-                    st.subheader("🕸️ Entity Graph")
-                    G = nx.Graph()
-                    for ent in entities:
-                        G.add_node(ent['word'], label=ent['entity_group'])
+    with gr.Tab("🗺️ NER + Graph"):
+        ner_input = gr.Textbox(label="Sentence with named entities")
+        ner_output = gr.Image(type="pil")
+        ner_btn = gr.Button("Visualize NER")
+        ner_btn.click(extract_ner_graph, ner_input, ner_output)
 
-                    for i in range(len(entities) - 1):
-                        G.add_edge(entities[i]['word'], entities[i + 1]['word'])
+    with gr.Tab("✍️ Fill in the Blank"):
+        mask_input = gr.Textbox(label="Sentence with [MASK]")
+        mask_output = gr.Textbox(label="Top 5 Completions", lines=6)
+        fill_btn = gr.Button("Fill Mask")
+        fill_btn.click(fill_text, mask_input, mask_output)
 
-                    fig, ax = plt.subplots()
-                    pos = nx.spring_layout(G)
-                    nx.draw(G, pos, with_labels=True, node_color='skyblue',
-                            edge_color='gray', node_size=2000, font_size=10, ax=ax)
-                    st.pyplot(fig)
-                else:
-                    st.info("No entities found.")
-
-# ---------------- TAB 4: Context-Aware Text Infilling ---------------- #
-with tab4:
-    st.header("✍️ Context-Aware Text Infilling (Masked Language Model)")
-    st.markdown("""
-    Type a sentence with one or more `[MASK]` tokens (e.g.,  
-    **"Forests are [MASK] to biodiversity and help regulate the [MASK]."**)  
-    and let the AI complete it.
-    """)
-
-    infill_input = st.text_area("📝 Enter masked sentence:", placeholder="Forests are [MASK] to biodiversity.")
-
-    if st.button("Fill Mask", key="infilling"):
-        if "[MASK]" not in infill_input.upper():
-            st.warning("Please include at least one [MASK] token in your sentence.")
-        else:
-            with st.spinner("Filling in the blanks..."):
-
-                @st.cache_resource
-                def load_mask_filler():
-                    return pipeline("fill-mask", model="bert-base-uncased")
-
-                fill_mask = load_mask_filler()
-                prepared_input = infill_input.replace("[mask]", "[MASK]").replace("[MASK]", fill_mask.tokenizer.mask_token)
-
-                try:
-                    results = fill_mask(prepared_input)
-                    if isinstance(results, list):
-                        st.subheader("🎯 Top Predictions:")
-                        for i, r in enumerate(results[:5]):
-                            filled = prepared_input.replace(fill_mask.tokenizer.mask_token, r['token_str'], 1)
-                            st.write(f"{i+1}. {filled}  (Score: {r['score']:.3f})")
-                    else:
-                        st.write("No predictions returned.")
-                except Exception as e:
-                    st.error(f"Error: {e}")
+demo.launch()
